@@ -122,7 +122,46 @@ void EXTI0_IRQHandler()
 	uint32_t* EXTI_PR = (uint32_t*)(EXTI_BASE_ADDR + 0x14);
 	*EXTI_PR |= (1<<0);
 }
+#define DMA2_BASE_ADDR	0x40026400
 
+char rx_buf[3268];
+void DMA_Init()
+{
+	__HAL_RCC_DMA2_CLK_ENABLE();
+	// use DMA2, stream 2, channel 4 for UART1_Rx
+
+	// địa chỉ người nhận -> thanh ghi nào?
+	uint32_t* DMA_S2M0AR = (uint32_t*)(DMA2_BASE_ADDR + 0x1C + 0x18 *2);
+	*DMA_S2M0AR = rx_buf;
+
+	// địa chỉ người gởi -> thanh ghi nào?
+	uint32_t* DMA_S2PAR = (uint32_t*)(DMA2_BASE_ADDR + 0x18 + 0x18 * 2);
+	*DMA_S2PAR = 0x40011004;
+
+	// kích thước gói data -> thanh ghi nào?
+	uint32_t* DMA_S2NDTR = (uint32_t*)(DMA2_BASE_ADDR + 0x14 + 0x18 * 2);
+	*DMA_S2NDTR = sizeof(rx_buf);
+
+	// enable DMA2, stream 2, channel 4
+	uint32_t* DMA_S2CR = (uint32_t*)(DMA2_BASE_ADDR + 0x10 + 0x18 * 2);
+	*DMA_S2CR &= ~(0b111<< 25);
+	*DMA_S2CR |= (0b100 << 25); 	// select channel 4 for stream 2
+	*DMA_S2CR |= (1 << 10);			// enable Memory increment mode
+	*DMA_S2CR |= (1 << 8);
+	*DMA_S2CR |= (1 << 4);			// enable transfer complete interrupt
+	*DMA_S2CR |= (1 << 0); 			// enable stream 2
+
+	int32_t* ISER1 = (uint32_t*)(0xE000E104);
+	*ISER1 |= 1 << 26;
+}
+int update_firmware;
+void DMA2_Stream2_IRQHandler()
+{
+	uint32_t* DMA_LIFCR = (uint32_t*)(DMA2_BASE_ADDR + 0x08);
+	*DMA_LIFCR |= 1 << 21;
+	update_firmware = 1;
+
+}
 #define UART1_BASE_ADDR	0x40011000
 #define GPIOB_BASE_ADDR	0x40020400
 void UART_Init()
@@ -157,11 +196,16 @@ void UART_Init()
 
 	uint32_t* CR1 = (uint32_t*)(UART1_BASE_ADDR + 0x0C);
 	*CR1 |= (1 << 12) | (1 << 10) | (1 << 3) | (1 << 2) | (1 << 13);
-
+#if  0
 	/* enable interrupt */
 	*CR1 |= (1 << 5);
 	uint32_t* NVIC_ISER1 = (uint32_t*)0xE000E104;
 	*NVIC_ISER1 |= 1<<5;
+#else
+	uint32_t* CR3 = (uint32_t*)(UART1_BASE_ADDR + 0x14);
+	*CR3 |= (1 << 6);
+	DMA_Init();
+#endif
 }
 
 
@@ -230,20 +274,283 @@ void USART1_IRQHandler(){
 	}
 }
 
+__attribute__((section(".RamFunc"))) void Flash_Erase_Sector(int sec_num)
+{
+	uint32_t* FLASH_SR = (uint32_t*)(0x40023C00 + 0x0C);
+	uint32_t* FLASH_CR = (uint32_t*)(0x40023C00 + 0x10);
+	if (((*FLASH_SR >> 16) & 1) == 0) {
+		if (((*FLASH_CR >> 31) & 1) == 1) {
+			uint32_t* FLASH_KEYR = (uint32_t*)(0x40023C00 + 0x04);
+			*FLASH_KEYR = 0x45670123;
+			*FLASH_KEYR = 0xCDEF89AB;
+		}
+		*FLASH_CR |= (0b01 << 1);
+		*FLASH_CR |= (sec_num << 3);
+		*FLASH_CR |= (0b01 << 16);
+		while(((*FLASH_SR >> 16) & 1) == 1);
+	}
+}
+
+__attribute__((section(".RamFunc"))) void Flash_Program(uint8_t* addr, uint8_t* buf, int size)
+{
+	uint32_t* FLASH_SR = (uint32_t*)(0x40023C00 + 0x0C);
+	uint32_t* FLASH_CR = (uint32_t*)(0x40023C00 + 0x10);
+	if (((*FLASH_SR >> 16) & 1) == 0) {
+		if (((*FLASH_CR >> 31) & 1) == 1) {
+			uint32_t* FLASH_KEYR = (uint32_t*)(0x40023C00 + 0x04);
+			*FLASH_KEYR = 0x45670123;
+			*FLASH_KEYR = 0xCDEF89AB;
+		}
+		*FLASH_CR |= (0b01 << 0);
+		*FLASH_CR |= (0b00 << 9);
+		for(int i = 0; i < size; i++)
+		{
+			addr[i] = buf[i];
+		}
+
+		while(((*FLASH_SR >> 16) & 1) == 1);
+	}
+}
+
+__attribute__((section(".RamFunc"))) void update()
+{
+	Flash_Erase_Sector(0);
+	Flash_Program(0x08000000, rx_buf, sizeof(rx_buf));
+	uint32_t* AIRCR = (uint32_t*)0xE000ED0C;
+	*AIRCR |= (0x5FA << 16) | (1 << 2);
+}
+#define I2C_BASE_ADDR 0x40005400
+void I2C_Init()
+{
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+	uint32_t* GPIOB_MODER = (uint32_t*)(GPIOB_BASE_ADDR);
+	*GPIOB_MODER &= ~(0b11 << 12);
+	*GPIOB_MODER |= (0b10 << 12);
+	*GPIOB_MODER &= ~(0b11 << 18);
+	*GPIOB_MODER |= (0b10 << 18);
+	uint32_t* GPIOB_AFRL = (uint32_t*)(GPIOB_BASE_ADDR + 0x20);
+	*GPIOB_AFRL &= ~(0b1111 << 24);
+	*GPIOB_AFRL |= (0b0100 << 24);
+	uint32_t* GPIOB_AFRH = (uint32_t*)(GPIOB_BASE_ADDR + 0x24);
+	*GPIOB_AFRH &= ~(0b1111 << 4);
+	*GPIOB_AFRH |= (0b0100 << 4);
+	__HAL_RCC_I2C1_CLK_ENABLE();
+	uint32_t* I2C_CR2 = (uint32_t*)(I2C_BASE_ADDR + 0x04);
+	*I2C_CR2 &= ~(0b11111 << 0);
+	*I2C_CR2 |= (16 << 0);
+	uint32_t* I2C_CCR = (uint32_t*)(I2C_BASE_ADDR + 0x1C);
+	*I2C_CCR &= (0xFFF << 0);
+	*I2C_CCR |= (160 << 0);
+	uint32_t* I2C_CR1 = (uint32_t*)(I2C_BASE_ADDR);
+	*I2C_CR1 |= (1 << 0);
+}
+
+void I2C_Write_Data(uint8_t slave_reg_addr, uint8_t slave_reg_val)
+{
+	//- Generate start bit
+	uint32_t* I2C_CR1 = (uint32_t*)(I2C_BASE_ADDR);
+	*I2C_CR1 |= (1 << 8);
+	// wait SB in SR1
+	uint32_t* I2C_SR1 = (uint32_t*)(I2C_BASE_ADDR + 0x14);
+	while(((*I2C_SR1 >> 0) &1)== 0);
+	//- Send 7 slave add + 1 bit write (0b0011001 << 1 | 0)
+	uint32_t* I2C_DATA = (uint32_t*)(I2C_BASE_ADDR + 0x10);
+	*I2C_DATA = 0b00110010;
+	while (((*I2C_SR1 >> 1) &1) == 0);
+	uint32_t* I2C_SR2 = (uint32_t*)(I2C_BASE_ADDR + 0x18);
+	uint32_t temp = *I2C_SR2;
+	//- Check ACK
+	while (((*I2C_SR1 >> 10) &1) == 1);
+	//- Send command frame.		 (0x1F)
+	*I2C_DATA = slave_reg_addr;
+	while(((*I2C_SR1 >> 2) &1) == 0);
+	//- check ACK
+	while (((*I2C_SR1 >> 10) &1) == 1);
+	//- Send write data		 (0b11000000)
+	*I2C_DATA = 0b11000000;
+	while(((*I2C_SR1 >> 2) &1) == 0);
+	//- Generate stop bit
+	*I2C_CR1 |= (1 << 9);
+}
+
+uint8_t I2C_Read_Data(uint8_t slave_reg_addr)
+{
+//	- Generate start bit
+	uint32_t* I2C_CR1 = (uint32_t*)(I2C_BASE_ADDR);
+	*I2C_CR1 |= (1 << 8);
+	uint32_t* I2C_SR1 = (uint32_t*)(I2C_BASE_ADDR + 0x14);
+	while(((*I2C_SR1 >> 0) &1)== 0);
+//	- Send 7 slave add + 1 bit write
+	uint32_t* I2C_DATA = (uint32_t*)(I2C_BASE_ADDR + 0x10);
+	*I2C_DATA = 0b00110010;
+	while (((*I2C_SR1 >> 1) &1) == 0);
+	uint32_t* I2C_SR2 = (uint32_t*)(I2C_BASE_ADDR + 0x18);
+	uint32_t temp = *I2C_SR2;
+//	- Check ACK
+	while (((*I2C_SR1 >> 10) &1) == 1);
+//	- Send command frame.
+	*I2C_DATA = slave_reg_addr;
+	while(((*I2C_SR1 >> 2) &1) == 0);
+//	- Check ACK
+	while (((*I2C_SR1 >> 10) &1) == 1);
+//	- Generate start bit
+	*I2C_CR1 |= (1 << 8);
+	while(((*I2C_SR1 >> 0) &1)== 0);
+//	- Send 7 slave add + 1 bit read
+	*I2C_DATA = 0b00110011;
+	while (((*I2C_SR1 >> 1) &1) == 0);
+	temp = *I2C_SR2;
+//	- Check ACK
+	while (((*I2C_SR1 >> 10) &1) == 1);
+//	- Read data
+	while(((*I2C_SR1 >> 6) &1) ==0);
+	uint8_t data = *I2C_DATA;
+//	- Generate stop bit
+	*I2C_CR1 |= (1 << 9);
+	return data;
+}
+
+#define GPIOE_BASE_ADDR		0x40021000
+#define SPI1_BASE_ADDR		0x40013000
+void spi_init()
+{
+	// map pin, PA5 - SPI1_SCK, PA6 - SPI1_MISO, PA7 - SPI1_MOSI
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	uint32_t* GPIOA_MODER = (uint32_t*)(GPIOA_BASE_ADDR + 0x00);
+	*GPIOA_MODER &= ~(0b111111 << 10);
+	*GPIOA_MODER |= (0b10 << 10) | (0b10 << 12) | (0b10 << 14);
+
+	uint32_t* GPIOA_AFRL = (uint32_t*)(GPIOA_BASE_ADDR + 0x20);
+	*GPIOA_AFRL &= ~(0xfff << 20);
+	*GPIOA_AFRL |= (5 << 20) | (5 << 24) | (5 << 28);
+	// PE3 set as GPIO_OUTPUT
+	__HAL_RCC_GPIOE_CLK_ENABLE();
+	uint32_t* GPIOE_MODER = (uint32_t*)(GPIOE_BASE_ADDR + 0x00);
+	*GPIOE_MODER &= ~(0b11 << 6);
+	*GPIOE_MODER |= (0b01 << 6);
+
+	__HAL_RCC_SPI1_CLK_ENABLE();	// 16Mhz
+	// stm32 as master, speed of SCLK = 1Mhz, use software slave management, enable SPI
+	uint16_t* SPI1_CR1 = (uint16_t*)(SPI1_BASE_ADDR + 0x00);
+	*SPI1_CR1 |= (1 << 2);
+	*SPI1_CR1 |= (0b011 << 3);
+	*SPI1_CR1 |= (1 << 9) | (1 << 8);
+	*SPI1_CR1 |= (1 << 6);
+}
+
+char spi_read(char reg_addr)
+{
+	uint32_t* GPIOE_ODR = (uint32_t*)(GPIOE_BASE_ADDR + 0x14);
+	*GPIOE_ODR &= ~(1<<3);	// set PE3 to LOW to active slave
+
+	uint16_t* SPI1_DR = (uint16_t*)(SPI1_BASE_ADDR + 0x0C);
+	uint16_t* SPI1_SR = (uint16_t*)(SPI1_BASE_ADDR + 0x08);
+
+	while(((*SPI1_SR >> 7)&1)==1);
+	*SPI1_DR = reg_addr | (1 << 7);
+	while(((*SPI1_SR >> 1)&1)==0);
+	while(((*SPI1_SR >> 7)&1)==1);
+
+	while(((*SPI1_SR >> 0)&1)==0);
+	char data = *SPI1_DR;
+
+
+	while(((*SPI1_SR >> 7)&1)==1);
+	*SPI1_DR = 0xff;
+	while(((*SPI1_SR >> 1)&1)==0);
+	while(((*SPI1_SR >> 7)&1)==1);
+
+	while(((*SPI1_SR >> 0)&1)==0);
+	data = *SPI1_DR;
+
+	*GPIOE_ODR |= (1<<3);	// set PE3 to HIGH to inactive slave
+
+	return data;
+
+}
+
+void spi_write(char reg_addr, char reg_val)
+{
+	uint32_t* GPIOE_ODR = (uint32_t*)(GPIOE_BASE_ADDR + 0x14);
+	*GPIOE_ODR &= ~(1<<3);	// set PE3 to LOW to active slave
+	uint16_t* SPI1_DR = (uint16_t*)(SPI1_BASE_ADDR + 0x0C);
+	uint16_t* SPI1_SR = (uint16_t*)(SPI1_BASE_ADDR + 0x08);
+
+	while(((*SPI1_SR >> 7)&1)==1);
+	*SPI1_DR = reg_addr;
+	while(((*SPI1_SR >> 1)&1)==0);
+	while(((*SPI1_SR >> 7)&1)==1);
+
+	while(((*SPI1_SR >> 0)&1)==0);
+	char data = *SPI1_DR;
+
+
+	while(((*SPI1_SR >> 7)&1)==1);
+	*SPI1_DR = reg_val;
+	while(((*SPI1_SR >> 1)&1)==0);
+	while(((*SPI1_SR >> 7)&1)==1);
+
+	while(((*SPI1_SR >> 0)&1)==0);
+	data = *SPI1_DR;
+
+	*GPIOE_ODR |= (1<<3);	// set PE3 to HIGH to inactive slave
+}
+
+#define TIM1_BASE_ADDR	0x40010000
+void time_init()
+{
+	__HAL_RCC_TIM1_CLK_ENABLE();
+	// 1s, PSC = 16000, ARR = 1000
+	uint16_t* TIM1_PSC = (uint16_t*)(TIM1_BASE_ADDR + 0x28);
+	uint16_t* TIM1_ARR = (uint16_t*)(TIM1_BASE_ADDR + 0x2C);
+	uint16_t* TIM1_CR1 = (uint16_t*)(TIM1_BASE_ADDR + 0x00);
+
+
+	*TIM1_PSC = 16000 - 1;
+	*TIM1_ARR = 1000;
+
+	uint16_t* TIM1_DIER = (uint16_t*)(TIM1_BASE_ADDR + 0x0C);
+	*TIM1_DIER |= (1<<0);
+
+	uint32_t* ISER0 = (uint32_t*)(0xe000e100);
+	*ISER0 |= (1<<25);
+
+	*TIM1_CR1 |= (1 << 0);	// count enable
+}
+
+int time_cnt = 0;
+void TIM1_UP_TIM10_IRQHandler()
+{
+	time_cnt++;
+	uint16_t* TIM1_SR = (uint16_t*)(TIM1_BASE_ADDR + 0x10);
+	*TIM1_SR &= ~(1<<0);
+}
+
+void delay(int time)
+{
+	time_cnt = 0;
+	while(time_cnt < time);
+}
 
 int main()
 {
-	HAL_Init();
 	LedInit();
 	ButtonInit();
 	EXTI0Init();
 	UART_Init();
+	spi_init();
+	char id = spi_read(0x0f);
+	id = spi_read(0x20);
+
+	spi_write(0x20, 0x0f);
+	id = spi_read(0x20);
+	time_init();
 	while(1)
 	{
-		LedCtrl(LED_BLUE, 1);
-		HAL_Delay(1000);
-		LedCtrl(LED_BLUE, 0);
-		HAL_Delay(1000);
+		LedCtrl(LED_RED, 1);
+		delay(10);
+		LedCtrl(LED_RED, 0);
+		delay(10);
 	}
 	return 0;
 }
