@@ -55,6 +55,7 @@ SECTIONS
   .isr_vector :
   {
     . = ALIGN(4);
+    KEEP(*(.vung_nay_de_luu_vttb))
     KEEP(*(.isr_vector)) /* Startup code */
     . = ALIGN(4);
   } >FLASH

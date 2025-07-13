@@ -506,7 +506,7 @@ void time_init()
 	uint16_t* TIM1_CR1 = (uint16_t*)(TIM1_BASE_ADDR + 0x00);
 
 
-	*TIM1_PSC = 16000 - 1;
+	*TIM1_PSC = 16 - 1;
 	*TIM1_ARR = 1000;
 
 	uint16_t* TIM1_DIER = (uint16_t*)(TIM1_BASE_ADDR + 0x0C);
@@ -518,39 +518,62 @@ void time_init()
 	*TIM1_CR1 |= (1 << 0);	// count enable
 }
 
-int time_cnt = 0;
+int time_cnt = 10;
 void TIM1_UP_TIM10_IRQHandler()
 {
 	time_cnt++;
 	uint16_t* TIM1_SR = (uint16_t*)(TIM1_BASE_ADDR + 0x10);
 	*TIM1_SR &= ~(1<<0);
 }
+#define ADC1_BASE_ADDR	0x40012000
+void Temp_Sensor_Init()
+{
+	__HAL_RCC_ADC1_CLK_ENABLE();
+	uint32_t* ADC_JSQR = (uint32_t*)(ADC1_BASE_ADDR + 0x38);
+	*ADC_JSQR = 16 << 15;
+	uint32_t* ADC_CCR = (uint32_t*)(ADC1_BASE_ADDR + 0x300 + 0x04);
+	*ADC_CCR |= (1 << 23);
+	uint32_t* ADC_SMPR1 = (uint32_t*)(ADC1_BASE_ADDR + 0x0C);
+	*ADC_SMPR1 |= (0b111 << 18);
+	uint32_t* ADC_CR2 = (uint32_t*)(ADC1_BASE_ADDR + 0x08);
+	*ADC_CR2 |= (1 << 0);
+}
 
+float Temp_Sensor_Read()
+{
+	uint32_t* ADC_CR2 = (uint32_t*)(ADC1_BASE_ADDR + 0x08);
+	*ADC_CR2 |= (1 << 22);
+	uint32_t* ADC_SR = (uint32_t*)(ADC1_BASE_ADDR + 0x00);
+	while(((*ADC_SR >> 2)&1)==0);
+	*ADC_SR &= ~(1<<2);
+	uint32_t* ADC_JDR1 = (uint32_t*)(ADC1_BASE_ADDR + 0x3C);
+	uint16_t adc_raw = *ADC_JDR1;
+	float vin =  (adc_raw * 3.0)/4095;
+	float temperature = ((vin - 0.76) / 0.0025) + 25;
+	return temperature;
+
+}
 void delay(int time)
 {
 	time_cnt = 0;
 	while(time_cnt < time);
 }
-
+float temp;
 int main()
 {
 	LedInit();
 	ButtonInit();
 	EXTI0Init();
 	UART_Init();
-	spi_init();
-	char id = spi_read(0x0f);
-	id = spi_read(0x20);
-
-	spi_write(0x20, 0x0f);
-	id = spi_read(0x20);
+	Temp_Sensor_Init();
 	time_init();
 	while(1)
 	{
 		LedCtrl(LED_RED, 1);
-		delay(10);
+		delay(1000);
 		LedCtrl(LED_RED, 0);
-		delay(10);
+		delay(1000);
+		Temp_Sensor_Read();
 	}
 	return 0;
 }
